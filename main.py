@@ -11,6 +11,9 @@ import tempfile
 import oss2
 import time
 import datetime
+import requests
+from PIL import Image
+import io
 
 app = FastAPI(title="视频处理API")
 
@@ -158,20 +161,57 @@ async def image_to_video(request: ImageToVideoRequest):
     output_filename = f"{uuid.uuid4()}.mp4"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     
-    # 创建视频
-    clip = ImageClip(request.image_url).set_duration(request.duration)
-    clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac')
-    
-    # 获取视频信息
-    video_info = get_video_info(output_path)
-    
-    # 上传到本地存储
-    video_url = upload_to_oss(output_path)
-    
-    # 清理本地文件
-    os.remove(output_path)
-    
-    return {"video_url": video_url, "duration": video_info["duration"]}
+    temp_image_path = None
+    try:
+        # 处理URL图像：如果是远程URL，先下载到本地临时文件
+        if request.image_url.startswith(('http://', 'https://')):
+            try:
+                print(f"下载图像: {request.image_url}")
+                
+                # 使用requests下载图片
+                response = requests.get(request.image_url, timeout=30)
+                if response.status_code == 200:
+                    img = Image.open(io.BytesIO(response.content))
+                    temp_image_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.jpg")
+                    img.save(temp_image_path)
+                    print(f"图像已下载到: {temp_image_path}")
+                    image_path = temp_image_path
+                else:
+                    raise HTTPException(status_code=400, detail=f"无法下载图像，状态码: {response.status_code}")
+            except Exception as e:
+                if temp_image_path and os.path.exists(temp_image_path):
+                    os.remove(temp_image_path)
+                raise HTTPException(status_code=400, detail=f"处理图像URL时出错: {str(e)}")
+        else:
+            # 本地文件路径
+            image_path = request.image_url
+        
+        # 创建视频
+        clip = ImageClip(image_path).set_duration(request.duration)
+        clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac')
+        
+        # 清理临时图像文件
+        if temp_image_path and os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+        
+        # 获取视频信息
+        video_info = get_video_info(output_path)
+        
+        # 上传到本地存储
+        video_url = upload_to_oss(output_path)
+        
+        # 清理本地文件
+        os.remove(output_path)
+        
+        return {"video_url": video_url, "duration": video_info["duration"]}
+    except Exception as e:
+        # 确保清理所有临时文件
+        if temp_image_path and os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        
+        raise HTTPException(status_code=500, detail=f"创建视频失败: {str(e)}")
 
 @app.post("/image-audio-to-video", response_model=VideoResponse)
 async def image_audio_to_video(request: ImageAudioToVideoRequest):
@@ -179,15 +219,61 @@ async def image_audio_to_video(request: ImageAudioToVideoRequest):
     output_filename = f"{uuid.uuid4()}.mp4"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     
-    # 转换音频格式并调整音量
+    temp_image_path = None
+    temp_audio_path = None
+    
     try:
-        converted_audio_path = convert_audio_format(request.audio_url, request.volume_db)
+        # 处理URL图像：如果是远程URL，先下载到本地临时文件
+        if request.image_url.startswith(('http://', 'https://')):
+            try:
+                print(f"下载图像: {request.image_url}")
+                # 使用requests下载图片
+                response = requests.get(request.image_url, timeout=30)
+                if response.status_code == 200:
+                    img = Image.open(io.BytesIO(response.content))
+                    temp_image_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.jpg")
+                    img.save(temp_image_path)
+                    print(f"图像已下载到: {temp_image_path}")
+                    image_path = temp_image_path
+                else:
+                    raise HTTPException(status_code=400, detail=f"无法下载图像，状态码: {response.status_code}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"处理图像URL时出错: {str(e)}")
+        else:
+            # 本地文件路径
+            image_path = request.image_url
+        
+        # 处理URL音频：如果是远程URL，先下载到本地临时文件
+        if request.audio_url.startswith(('http://', 'https://')):
+            try:
+                print(f"下载音频: {request.audio_url}")
+                temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp3")
+                # 使用requests下载音频
+                response = requests.get(request.audio_url, timeout=30)
+                if response.status_code == 200:
+                    with open(temp_audio_path, 'wb') as f:
+                        f.write(response.content)
+                    print(f"音频已下载到: {temp_audio_path}")
+                    audio_path = temp_audio_path
+                else:
+                    raise HTTPException(status_code=400, detail=f"无法下载音频，状态码: {response.status_code}")
+            except Exception as e:
+                # 清理临时文件
+                if temp_image_path and os.path.exists(temp_image_path):
+                    os.remove(temp_image_path)
+                raise HTTPException(status_code=400, detail=f"处理音频URL时出错: {str(e)}")
+        else:
+            # 本地文件路径
+            audio_path = request.audio_url
+            
+        # 转换音频格式并调整音量
+        converted_audio_path = convert_audio_format(audio_path, request.volume_db)
         
         # 加载音频
         audio = AudioFileClip(converted_audio_path)
         
         # 创建视频
-        clip = ImageClip(request.image_url).set_duration(audio.duration)
+        clip = ImageClip(image_path).set_duration(audio.duration)
         clip = clip.set_audio(audio)
         
         # 使用更明确的编码器设置
@@ -198,6 +284,12 @@ async def image_audio_to_video(request: ImageAudioToVideoRequest):
             audio_codec='aac',
             audio_bitrate='192k'
         )
+        
+        # 清理所有临时文件
+        if temp_image_path and os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            os.remove(temp_audio_path)
         
         # 获取视频信息
         video_info = get_video_info(output_path)
@@ -213,7 +305,11 @@ async def image_audio_to_video(request: ImageAudioToVideoRequest):
         
         return {"video_url": video_url, "duration": video_info["duration"]}
     except Exception as e:
-        # 清理临时文件
+        # 清理所有临时文件
+        if temp_image_path and os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            os.remove(temp_audio_path)
         if os.path.exists(output_path):
             os.remove(output_path)
             
@@ -225,34 +321,86 @@ async def concatenate_videos(request: ConcatenateVideosRequest):
     output_filename = f"{uuid.uuid4()}.mp4"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     
-    # 加载所有视频
-    clips = []
-    for url in request.video_urls:
-        clip = VideoFileClip(url)
-        if request.volume_db != 0:
-            # 调整音频音量
-            clip = clip.volumex(10**(request.volume_db/20))
-        clips.append(clip)
+    # 临时文件列表，用于清理
+    temp_files = []
     
-    # 拼接视频
-    final_clip = concatenate_videoclips(clips)
-    final_clip.write_videofile(
-        output_path,
-        codec='libx264',
-        audio_codec='aac',
-        audio_bitrate='192k'
-    )
-    
-    # 获取视频信息
-    video_info = get_video_info(output_path)
-    
-    # 上传到本地存储
-    video_url = upload_to_oss(output_path)
-    
-    # 清理本地文件
-    os.remove(output_path)
-    
-    return {"video_url": video_url, "duration": video_info["duration"]}
+    try:
+        # 加载所有视频，如果是远程URL则先下载到本地
+        clips = []
+        for url in request.video_urls:
+            local_video_path = None
+            
+            # 检查是否为远程URL
+            if url.startswith(('http://', 'https://')):
+                try:
+                    # 创建临时文件下载路径
+                    local_video_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
+                    
+                    # 下载视频文件
+                    print(f"下载视频: {url}")
+                    response = requests.get(url, stream=True, timeout=30)
+                    if response.status_code == 200:
+                        with open(local_video_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=1024*1024):
+                                if chunk:  # 过滤掉保持连接的空数据块
+                                    f.write(chunk)
+                        print(f"视频已下载到: {local_video_path}")
+                        temp_files.append(local_video_path)
+                        video_path = local_video_path
+                    else:
+                        raise HTTPException(status_code=400, detail=f"无法下载视频，状态码: {response.status_code}")
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"处理视频URL时出错: {str(e)}")
+            else:
+                # 本地文件路径
+                video_path = url
+            
+            # 加载视频
+            clip = VideoFileClip(video_path)
+            if request.volume_db != 0:
+                # 调整音频音量
+                clip = clip.volumex(10**(request.volume_db/20))
+            clips.append(clip)
+        
+        if not clips:
+            raise HTTPException(status_code=400, detail="没有有效的视频文件可合并")
+        
+        # 拼接视频
+        final_clip = concatenate_videoclips(clips)
+        final_clip.write_videofile(
+            output_path,
+            codec='libx264',
+            audio_codec='aac',
+            audio_bitrate='192k'
+        )
+        
+        # 获取视频信息
+        video_info = get_video_info(output_path)
+        
+        # 上传到本地存储
+        video_url = upload_to_oss(output_path)
+        
+        # 清理所有临时文件
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        
+        # 清理输出文件
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        
+        return {"video_url": video_url, "duration": video_info["duration"]}
+    except Exception as e:
+        # 清理所有临时文件
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        
+        # 清理输出文件
+        if os.path.exists(output_path):
+            os.remove(output_path)
+            
+        raise HTTPException(status_code=500, detail=f"合并视频失败: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
