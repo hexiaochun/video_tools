@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import os
 from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip, concatenate_videoclips
 import uuid
@@ -109,100 +109,121 @@ class ConcatenateVideosRequest(BaseModel):
         le=20
     )
 
-@app.post("/image-to-video")
-async def image_to_video(request: ImageToVideoRequest):
+class VideoResponse(BaseModel):
+    video_url: str
+    duration: float
     
-        # 生成唯一输出文件名
-        output_filename = f"{uuid.uuid4()}.mp4"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
+def get_video_info(file_path: str) -> Dict[str, Any]:
+    """获取视频信息，包括时长等"""
+    try:
+        video = VideoFileClip(file_path)
+        info = {
+            "duration": round(video.duration, 2),  # 视频时长（秒）
+            "size": os.path.getsize(file_path),    # 文件大小（字节）
+            "fps": video.fps if hasattr(video, 'fps') else None,  # 帧率
+            "width": video.w if hasattr(video, 'w') else None,    # 宽度
+            "height": video.h if hasattr(video, 'h') else None    # 高度
+        }
+        video.close()  # 关闭视频文件
+        return info
+    except Exception as e:
+        print(f"获取视频信息失败: {str(e)}")
+        return {"duration": 0, "error": str(e)}
+
+@app.post("/image-to-video", response_model=VideoResponse)
+async def image_to_video(request: ImageToVideoRequest):
+    # 生成唯一输出文件名
+    output_filename = f"{uuid.uuid4()}.mp4"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    
+    # 创建视频
+    clip = ImageClip(request.image_url).set_duration(request.duration)
+    clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac')
+    
+    # 获取视频信息
+    video_info = get_video_info(output_path)
+    
+    # 上传到本地存储
+    video_url = upload_to_oss(output_path)
+    
+    # 清理本地文件
+    os.remove(output_path)
+    
+    return {"video_url": video_url, "duration": video_info["duration"]}
+
+@app.post("/image-audio-to-video", response_model=VideoResponse)
+async def image_audio_to_video(request: ImageAudioToVideoRequest):
+    # 生成唯一输出文件名
+    output_filename = f"{uuid.uuid4()}.mp4"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    
+    # 转换音频格式并调整音量
+    converted_audio_url = convert_audio_format(request.audio_url, request.volume_db)
+    
+    try:
+        # 加载音频
+        audio = AudioFileClip(converted_audio_url)
         
         # 创建视频
-        clip = ImageClip(request.image_url).set_duration(request.duration)
-        clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac')
+        clip = ImageClip(request.image_url).set_duration(audio.duration)
+        clip = clip.set_audio(audio)
         
-        # 上传到OSS
-        video_url = upload_to_oss(output_path)
-        
-        # 清理本地文件
-        os.remove(output_path)
-        
-        return {"video_url": video_url}
-    
-
-@app.post("/image-audio-to-video")
-async def image_audio_to_video(request: ImageAudioToVideoRequest):
-    try:
-        # 生成唯一输出文件名
-        output_filename = f"{uuid.uuid4()}.mp4"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-        
-        # 转换音频格式并调整音量
-        converted_audio_url = convert_audio_format(request.audio_url, request.volume_db)
-        
-        try:
-            # 加载音频
-            audio = AudioFileClip(converted_audio_url)
-            
-            # 创建视频
-            clip = ImageClip(request.image_url).set_duration(audio.duration)
-            clip = clip.set_audio(audio)
-            
-            # 使用更明确的编码器设置
-            clip.write_videofile(
-                output_path,
-                fps=24,
-                codec='libx264',
-                audio_codec='aac',
-                audio_bitrate='192k'
-            )
-            
-            # 上传到OSS
-            video_url = upload_to_oss(output_path)
-            
-            # 清理本地文件
-            os.remove(output_path)
-            
-            return {"video_url": video_url}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-                
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/concatenate-videos")
-async def concatenate_videos(request: ConcatenateVideosRequest):
-    try:
-        # 生成唯一输出文件名
-        output_filename = f"{uuid.uuid4()}.mp4"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-        
-        # 加载所有视频
-        clips = []
-        for url in request.video_urls:
-            clip = VideoFileClip(url)
-            if request.volume_db != 0:
-                # 调整音频音量
-                clip = clip.volumex(10**(request.volume_db/20))
-            clips.append(clip)
-        
-        # 拼接视频
-        final_clip = concatenate_videoclips(clips)
-        final_clip.write_videofile(
+        # 使用更明确的编码器设置
+        clip.write_videofile(
             output_path,
+            fps=24,
             codec='libx264',
             audio_codec='aac',
             audio_bitrate='192k'
         )
         
-        # 上传到OSS
+        # 获取视频信息
+        video_info = get_video_info(output_path)
+        
+        # 上传到本地存储
         video_url = upload_to_oss(output_path)
         
         # 清理本地文件
         os.remove(output_path)
         
-        return {"video_url": video_url}
+        return {"video_url": video_url, "duration": video_info["duration"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/concatenate-videos", response_model=VideoResponse)
+async def concatenate_videos(request: ConcatenateVideosRequest):
+    # 生成唯一输出文件名
+    output_filename = f"{uuid.uuid4()}.mp4"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    
+    # 加载所有视频
+    clips = []
+    for url in request.video_urls:
+        clip = VideoFileClip(url)
+        if request.volume_db != 0:
+            # 调整音频音量
+            clip = clip.volumex(10**(request.volume_db/20))
+        clips.append(clip)
+    
+    # 拼接视频
+    final_clip = concatenate_videoclips(clips)
+    final_clip.write_videofile(
+        output_path,
+        codec='libx264',
+        audio_codec='aac',
+        audio_bitrate='192k'
+    )
+    
+    # 获取视频信息
+    video_info = get_video_info(output_path)
+    
+    # 上传到本地存储
+    video_url = upload_to_oss(output_path)
+    
+    # 清理本地文件
+    os.remove(output_path)
+    
+    return {"video_url": video_url, "duration": video_info["duration"]}
 
 if __name__ == "__main__":
     import uvicorn
