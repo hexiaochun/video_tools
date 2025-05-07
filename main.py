@@ -48,9 +48,14 @@ def upload_local_file(file_path):
     shutil.copy(file_path, destination)
     print(f"文件已保存到本地目录: {destination}")
     
-    # 返回可访问的URL
+    # 返回可访问的URL（相对URL）
     url = f"/static/videos/{year_month}/{day}/{output_filename}"
     print(f"生成的文件URL: {url}")
+    
+    # 返回绝对文件路径
+    abs_path = os.path.abspath(destination)
+    print(f"文件的绝对路径: {abs_path}")
+    
     return url
 
 def upload_to_oss(file_path: str) -> str:
@@ -59,9 +64,10 @@ def upload_to_oss(file_path: str) -> str:
     return upload_local_file(file_path)
 
 def convert_audio_format(input_path, volume_db: float = 0):
-    """将音频转换为WAV格式并调整音量，上传到OSS后返回URL"""
+    """将音频转换为WAV格式并调整音量，并保存到静态文件目录"""
     temp_dir = tempfile.gettempdir()
-    output_path = os.path.join(temp_dir, f"{uuid.uuid4()}.wav")
+    temp_output_filename = f"{uuid.uuid4()}.wav"
+    temp_output_path = os.path.join(temp_dir, temp_output_filename)
     
     try:
         # 使用ffmpeg转换音频格式并调整音量
@@ -72,19 +78,35 @@ def convert_audio_format(input_path, volume_db: float = 0):
             '-ac', '2',              # 设置声道数
             '-af', f'volume={10**(volume_db/20)}',  # 调整音量
             '-y',                    # 覆盖已存在的文件
-            output_path
+            temp_output_path
         ]
         subprocess.run(command, check=True, capture_output=True)
         
-        # 上传到本地
-        audio_url = upload_local_file(output_path)
+        # 获取年月日目录
+        year_month, day = get_date_directory()
+        static_audio_dir = os.path.join(STATIC_DIR, "videos", year_month, day)
+        os.makedirs(static_audio_dir, exist_ok=True)
         
-        # 清理本地临时文件
-        os.remove(output_path)
+        # 复制文件到静态目录
+        final_filename = f"{uuid.uuid4()}.wav"
+        final_path = os.path.join(static_audio_dir, final_filename)
+        shutil.copy(temp_output_path, final_path)
         
-        return audio_url
+        # 清理临时文件
+        os.remove(temp_output_path)
+        
+        print(f"音频文件已保存到: {final_path}")
+        return final_path
     except subprocess.CalledProcessError as e:
+        # 清理临时文件
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
         raise Exception(f"音频转换失败: {str(e)}")
+    except Exception as e:
+        # 清理临时文件
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
+        raise Exception(f"音频处理失败: {str(e)}")
 
 class ImageToVideoRequest(BaseModel):
     image_url: str
@@ -158,11 +180,11 @@ async def image_audio_to_video(request: ImageAudioToVideoRequest):
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     
     # 转换音频格式并调整音量
-    converted_audio_url = convert_audio_format(request.audio_url, request.volume_db)
-    
     try:
+        converted_audio_path = convert_audio_format(request.audio_url, request.volume_db)
+        
         # 加载音频
-        audio = AudioFileClip(converted_audio_url)
+        audio = AudioFileClip(converted_audio_path)
         
         # 创建视频
         clip = ImageClip(request.image_url).set_duration(audio.duration)
@@ -185,10 +207,17 @@ async def image_audio_to_video(request: ImageAudioToVideoRequest):
         
         # 清理本地文件
         os.remove(output_path)
+        # 清理转换后的音频文件（如果存在且是临时文件）
+        if os.path.exists(converted_audio_path) and converted_audio_path.startswith(tempfile.gettempdir()):
+            os.remove(converted_audio_path)
         
         return {"video_url": video_url, "duration": video_info["duration"]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # 清理临时文件
+        if os.path.exists(output_path):
+            os.remove(output_path)
+            
+        raise HTTPException(status_code=500, detail=f"创建视频失败: {str(e)}")
 
 @app.post("/concatenate-videos", response_model=VideoResponse)
 async def concatenate_videos(request: ConcatenateVideosRequest):
